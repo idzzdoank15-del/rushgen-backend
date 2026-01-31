@@ -10,24 +10,23 @@ app.use(express.json({ limit: "25mb" }));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// ===== Optional local storage for job mapping (best-effort) =====
+// Catatan: di Render free, disk bisa hilang saat restart. Jadi ini hanya membantu,
+// tapi backend tetap bisa jalan tanpa file ini.
 const DATA_DIR = path.join(__dirname, "data");
-const KEY_FILE = path.join(DATA_DIR, "key.json");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+try {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (_) {}
 
-// ===== helpers: key =====
-function getKey() {
-  if (!fs.existsSync(KEY_FILE)) return null;
-  try {
-    const j = JSON.parse(fs.readFileSync(KEY_FILE, "utf8"));
-    return j.key || null;
-  } catch {
-    return null;
-  }
+// ===== helpers: auth key =====
+function getApiKeyFromReq(req) {
+  const h = String(req.headers["authorization"] || "");
+  if (!h.toLowerCase().startsWith("bearer ")) return null;
+  const key = h.slice(7).trim();
+  return key || null;
 }
-function setKey(key) {
-  fs.writeFileSync(KEY_FILE, JSON.stringify({ key }, null, 2), "utf8");
-}
+
 function fpHeaders(apiKey) {
   return {
     "x-freepik-api-key": apiKey,
@@ -35,17 +34,19 @@ function fpHeaders(apiKey) {
   };
 }
 
-// ===== helpers: jobs map (taskId -> provider) =====
+// ===== helpers: jobs map (taskId -> provider) (best-effort) =====
 function readJobs() {
-  if (!fs.existsSync(JOBS_FILE)) return {};
   try {
+    if (!fs.existsSync(JOBS_FILE)) return {};
     return JSON.parse(fs.readFileSync(JOBS_FILE, "utf8")) || {};
   } catch {
     return {};
   }
 }
 function writeJobs(obj) {
-  fs.writeFileSync(JOBS_FILE, JSON.stringify(obj, null, 2), "utf8");
+  try {
+    fs.writeFileSync(JOBS_FILE, JSON.stringify(obj, null, 2), "utf8");
+  } catch (_) {}
 }
 function saveJob(taskId, provider) {
   const jobs = readJobs();
@@ -57,6 +58,7 @@ function getJob(taskId) {
   return jobs[taskId] || null;
 }
 
+// ===== misc helpers =====
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -109,44 +111,75 @@ const FREEPIK_BASE = "https://api.freepik.com";
 
 const PROVIDERS = {
   "kling-2.5-pro": {
-    // Create: /kling-v2-5-pro
     createUrl: `${FREEPIK_BASE}/v1/ai/image-to-video/kling-v2-5-pro`,
-    // Status: /kling-v2-5-pro/{task-id}
-    statusUrl: (taskId) => `${FREEPIK_BASE}/v1/ai/image-to-video/kling-v2-5-pro/${taskId}`,
+    statusUrl: (taskId) =>
+      `${FREEPIK_BASE}/v1/ai/image-to-video/kling-v2-5-pro/${taskId}`,
   },
 
   "kling-2.1-pro": {
-    // Create: /kling-v2-1-pro
     createUrl: `${FREEPIK_BASE}/v1/ai/image-to-video/kling-v2-1-pro`,
-    // Status: /kling-v2-1/{task-id}  (INI YANG BEDANYA)
-    statusUrl: (taskId) => `${FREEPIK_BASE}/v1/ai/image-to-video/kling-v2-1/${taskId}`,
+    statusUrl: (taskId) =>
+      `${FREEPIK_BASE}/v1/ai/image-to-video/kling-v2-1/${taskId}`,
   },
 };
 
 function pickProvider(p) {
   const key = String(p || "").trim();
   if (PROVIDERS[key]) return key;
-  // default: yang sudah jalan dulu
   return "kling-2.5-pro";
+}
+
+// kalau mapping jobId hilang (Render restart), fallback:
+// coba status ke 2.5 dulu, kalau error 404/400 tertentu, coba 2.1
+async function fetchStatusWithFallback(taskId, apiKey, preferredProvider) {
+  const tryOrder = [];
+
+  if (preferredProvider && PROVIDERS[preferredProvider]) {
+    tryOrder.push(preferredProvider);
+  }
+  // default order
+  if (!tryOrder.includes("kling-2.5-pro")) tryOrder.push("kling-2.5-pro");
+  if (!tryOrder.includes("kling-2.1-pro")) tryOrder.push("kling-2.1-pro");
+
+  let last = null;
+
+  for (const provider of tryOrder) {
+    const cfg = PROVIDERS[provider];
+    const r = await fetchJsonRetry(cfg.statusUrl(taskId), {
+      method: "GET",
+      headers: { "x-freepik-api-key": apiKey },
+    });
+
+    // kalau ok, selesai
+    if (r.ok) return { provider, resp: r };
+
+    // simpan error terakhir
+    last = { provider, resp: r };
+
+    // kalau error bukan karena endpoint salah (misal 401), hentikan cepat
+    if (r.status === 401 || r.status === 403) {
+      break;
+    }
+
+    // kalau 404 / 400, bisa jadi salah endpoint status, lanjut coba provider lain
+    // selain itu, tetap lanjut (karena kadang transient).
+  }
+
+  return last; // {provider, resp}
 }
 
 // ===== routes =====
 app.get("/ping", (req, res) => res.json({ ok: true }));
 
-app.get("/key", (req, res) => res.json({ hasKey: !!getKey() }));
-
-app.post("/key", (req, res) => {
-  const key = (req.body?.key || "").trim();
-  if (!key) return res.status(400).json({ error: "API key kosong" });
-  setKey(key);
-  res.json({ ok: true });
-});
-
 // CREATE TASK
 app.post("/generate", upload.single("image"), async (req, res) => {
   try {
-    const apiKey = getKey();
-    if (!apiKey) return res.status(400).json({ error: "API key belum disimpan." });
+    const apiKey = getApiKeyFromReq(req);
+    if (!apiKey) {
+      return res.status(401).json({
+        error: "API key wajib. Kirim header: Authorization: Bearer <APIKEY>",
+      });
+    }
 
     const provider = pickProvider(req.body?.provider);
     const cfg = PROVIDERS[provider];
@@ -156,7 +189,6 @@ app.post("/generate", upload.single("image"), async (req, res) => {
       negative_prompt = "",
       duration = "5",
       cfg_scale = 0.5,
-      // optional (buat future)
       image_tail = "",
       webhook_url = "",
     } = req.body;
@@ -166,21 +198,18 @@ app.post("/generate", upload.single("image"), async (req, res) => {
 
     const imageBase64 = img.buffer.toString("base64");
 
-    // payload general: works utk 2.5 & 2.1
     const payload = {
-      duration: String(duration),        // "5" / "10"
-      image: imageBase64,                // base64
+      duration: String(duration),
+      image: imageBase64,
       prompt: String(prompt || ""),
       negative_prompt: String(negative_prompt || ""),
-      cfg_scale: Number(cfg_scale),      // 0..1
+      cfg_scale: Number(cfg_scale),
     };
 
-    // Kling 2.1 Pro support image_tail (optional)
     if (provider === "kling-2.1-pro" && image_tail && image_tail !== "null") {
       payload.image_tail = String(image_tail);
     }
 
-    // optional webhook
     if (webhook_url && String(webhook_url).trim()) {
       payload.webhook_url = String(webhook_url).trim();
     }
@@ -201,36 +230,48 @@ app.post("/generate", upload.single("image"), async (req, res) => {
 
     const taskId = r.data?.data?.task_id;
     if (!taskId) {
-      return res.status(500).json({ error: "task_id tidak ditemukan", provider, detail: r.data });
+      return res.status(500).json({
+        error: "task_id tidak ditemukan",
+        provider,
+        detail: r.data,
+      });
     }
 
-    // simpan mapping taskId -> provider
+    // best-effort simpan mapping
     saveJob(taskId, provider);
 
     res.json({ jobId: taskId, provider });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Server error generate", detail: String(e?.message || e) });
+    res.status(500).json({
+      error: "Server error generate",
+      detail: String(e?.message || e),
+    });
   }
 });
 
-// STATUS (GET by task-id)
+// STATUS
 app.get("/status/:jobId", async (req, res) => {
   try {
-    const apiKey = getKey();
-    if (!apiKey) return res.status(400).json({ status: "error", error: "API key belum disimpan." });
+    const apiKey = getApiKeyFromReq(req);
+    if (!apiKey) {
+      return res.status(401).json({
+        status: "error",
+        error: "API key wajib (Authorization: Bearer <APIKEY>)",
+      });
+    }
 
     const taskId = req.params.jobId;
 
-    // ambil provider dari storage (kalau ga ada, default)
     const meta = getJob(taskId);
-    const provider = meta?.provider ? pickProvider(meta.provider) : "kling-2.5-pro";
-    const cfg = PROVIDERS[provider];
+    const preferredProvider = meta?.provider ? pickProvider(meta.provider) : null;
 
-    const r = await fetchJsonRetry(cfg.statusUrl(taskId), {
-      method: "GET",
-      headers: { "x-freepik-api-key": apiKey },
-    });
+    const out = await fetchStatusWithFallback(taskId, apiKey, preferredProvider);
+    if (!out || !out.resp) {
+      return res.status(500).json({ status: "error", error: "Status fetch gagal" });
+    }
+
+    const { provider, resp: r } = out;
 
     if (!r.ok) {
       return res.status(r.status).json({
@@ -244,6 +285,9 @@ app.get("/status/:jobId", async (req, res) => {
     const statusRaw = r.data?.data?.status;
     const status = normalizeStatus(statusRaw);
 
+    // kalau berhasil dan meta belum ada, simpan provider (best effort)
+    if (!meta) saveJob(taskId, provider);
+
     res.json({
       status,
       raw_status: statusRaw,
@@ -252,43 +296,72 @@ app.get("/status/:jobId", async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ status: "error", error: "Server error status", detail: String(e?.message || e) });
+    res.status(500).json({
+      status: "error",
+      error: "Server error status",
+      detail: String(e?.message || e),
+    });
   }
 });
 
 // RESULT
 app.get("/result/:jobId", async (req, res) => {
   try {
-    const apiKey = getKey();
-    if (!apiKey) return res.status(400).json({ error: "API key belum disimpan." });
+    const apiKey = getApiKeyFromReq(req);
+    if (!apiKey) {
+      return res.status(401).json({
+        error: "API key wajib (Authorization: Bearer <APIKEY>)",
+      });
+    }
 
     const taskId = req.params.jobId;
 
     const meta = getJob(taskId);
-    const provider = meta?.provider ? pickProvider(meta.provider) : "kling-2.5-pro";
-    const cfg = PROVIDERS[provider];
+    const preferredProvider = meta?.provider ? pickProvider(meta.provider) : null;
 
-    const r = await fetchJsonRetry(cfg.statusUrl(taskId), {
-      method: "GET",
-      headers: { "x-freepik-api-key": apiKey },
-    });
+    const out = await fetchStatusWithFallback(taskId, apiKey, preferredProvider);
+    if (!out || !out.resp) {
+      return res.status(500).json({ error: "Result fetch gagal" });
+    }
+
+    const { provider, resp: r } = out;
 
     if (!r.ok) {
-      return res.status(r.status).json({ error: "Result fetch gagal", provider, detail: r.data });
+      return res.status(r.status).json({
+        error: "Result fetch gagal",
+        provider,
+        detail: r.data,
+      });
     }
 
     const statusRaw = r.data?.data?.status;
     if (String(statusRaw).toUpperCase() !== "COMPLETED") {
-      return res.status(400).json({ error: "Belum selesai", provider, raw_status: statusRaw });
+      return res.status(400).json({
+        error: "Belum selesai",
+        provider,
+        raw_status: statusRaw,
+      });
     }
 
     const url = extractGeneratedUrl(r.data);
-    if (!url) return res.status(400).json({ error: "COMPLETED tapi generated URL kosong", provider, detail: r.data });
+    if (!url) {
+      return res.status(400).json({
+        error: "COMPLETED tapi generated URL kosong",
+        provider,
+        detail: r.data,
+      });
+    }
+
+    // best-effort simpan provider
+    if (!meta) saveJob(taskId, provider);
 
     res.json({ videoUrl: url, provider });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Server error result", detail: String(e?.message || e) });
+    res.status(500).json({
+      error: "Server error result",
+      detail: String(e?.message || e),
+    });
   }
 });
 
@@ -298,4 +371,3 @@ app.listen(PORT, () => {
   console.log("✅ Backend Kling jalan di port:", PORT);
   console.log("✅ Provider aktif:", Object.keys(PROVIDERS));
 });
-
